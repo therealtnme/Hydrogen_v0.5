@@ -52,13 +52,26 @@ class HydrogenConfig(PreTrainedConfig):
             auxiliary-loss-free balancing bias, plus one always-on shared expert of `moe_intermediate_size`.
         num_experts_per_tok (`int`), moe_intermediate_size (`int`), first_dense_layers (`int`),
         router_bias_update_rate (`float`): MoE shape and balancing-bias step.
+        kv_evict_epsilon (`float`): Drop cached keys once the forget gates guarantee they can never again hold more
+            than this fraction of any attention weight (0 disables it). Because queries and keys are RMS-normalized the
+            attention logits are bounded, which turns the cumulative forget gates into a provable upper bound on each
+            key's future weight - so this trades a stated tolerance, not a guess, for a smaller KV cache and less
+            attention work. Fast-forgetting heads free the most; the first few keys and the current block are kept.
         session_learning_rate (`float`): Step size of session learning (0 disables it). With a cache, every input the
             model reads (prompt, tool result, user turn) is predicted in 64-token chunks and then learned from with one
             gradient step on the session's own corrections to the decoder MLP output projections, kept in the cache and
             dropped with it. On the bench: -0.06 nats on 1K-token documents (more on a less trained model), growing
             the longer a session runs, for ~3x the compute on *input* tokens; decoding speed is unchanged. Set 0 for
-            throughput-bound serving. Tuned at the bench scale (0.3-0.5 best, 1.0 diverges); re-tune with
-            test/session_eval.py for new sizes.
+            throughput-bound serving. The corrections are kept in bf16 and bounded to a tenth of the weight they
+            correct, so a long session stays a correction rather than a different model (both measured free).
+            Tuned at the bench scale (0.3-0.5 best, 1.0 diverges); re-tune with test/session_eval.py for new sizes.
+        novelty_rate (`float`): Step size of novelty learning (0 disables it). While the model generates, it records
+            how its own answer could be made less likely; when the next input arrives it steps its session corrections
+            that way, so each new answer moves away from what it already proposed - more distinct names, ideas and
+            approaches on every retry, while each answer stays internally consistent. On the bench (test/creativity.py):
+            answer-to-answer overlap -57% and within-answer distinct 3-grams up, at unchanged judged quality, for ~4%
+            of decoding speed (the gradient is taken along each MLP output's direct path to the output head, so no
+            backward pass is needed).
 
     Example:
 
@@ -107,7 +120,9 @@ class HydrogenConfig(PreTrainedConfig):
     moe_intermediate_size: int = 512
     first_dense_layers: int = 1
     router_bias_update_rate: float | int = 1e-3
+    kv_evict_epsilon: float | int = 0.0
     session_learning_rate: float | int = 0.5
+    novelty_rate: float | int = 0.3
 
     layer_types: list[str] | None = None  # derived: the cache layout transformers builds for generation
 
