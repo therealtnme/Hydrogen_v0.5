@@ -27,6 +27,8 @@ CANON_A, MIXER_CONV, CANON_C, CANON_D, DECODER_KV_CONV = 0, 1, 2, 3, 4
 CANON_KERNEL, CONV_KERNEL, SINKHORN_ITERS = 4, 3, 4
 # Session learning takes one step per this many input tokens: 64 kept 91% of the accuracy gain of 32 at 1.7x the speed
 SESSION_CHUNK = 64
+EVICT_EVERY = 64  # cached keys are tested for eviction this often (in tokens), so the test costs nothing per token
+EVICT_SINKS = 4  # the first tokens are never evicted: attention parks probability mass on them
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -107,6 +109,7 @@ class HydrogenCache(DynamicCache):
     def reorder_cache(self, beam_idx: torch.LongTensor):
         super().reorder_cache(beam_idx)
         side = self.side()
+        side.pop("novelty_steps", None)  # recorded steps belong to the pre-reorder beams
         for key, value in side.items():
             if isinstance(value, torch.Tensor):
                 side[key] = value.index_select(0, beam_idx.to(value.device))
@@ -121,15 +124,15 @@ def detach_cache(cache: Cache) -> None:
     for layer in cache.layers:
         for name in ("keys", "values"):
             value = getattr(layer, name, None)
-            if isinstance(value, torch.Tensor) and value.requires_grad:
+            if isinstance(value, torch.Tensor) and value.grad_fn is not None:
                 setattr(layer, name, value.detach())
         for states in (getattr(layer, "conv_states", None), getattr(layer, "recurrent_states", None)):
             for key, value in (states or {}).items():
-                if isinstance(value, torch.Tensor) and value.requires_grad:
+                if isinstance(value, torch.Tensor) and value.grad_fn is not None:
                     states[key] = value.detach()
     side = side_states(cache)
     for key, value in side.items():
-        if isinstance(value, torch.Tensor) and value.requires_grad:
+        if isinstance(value, torch.Tensor) and value.grad_fn is not None:  # leaves (session corrections) stay leaves
             side[key] = value.detach()
 
 
@@ -282,6 +285,37 @@ class HydrogenAttention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1) * torch.sigmoid(self.gate_proj(hidden_states))
         return self.o_proj(attn_output)
 
+    def _evict(self, past_key_values, keys_forget, queries):
+        """
+        Drop keys the forget gates have made irrelevant. Attention weights here are bounded: queries and keys are
+        RMS-normalized, so a logit cannot exceed `exp(log_temperature) * sqrt(head_dim)` in magnitude, and key j is
+        down-weighted by `exp(F_i - F_j)` for every later query i. Once
+
+            2 * logit_bound + (F_i - F_j) < log(eviction epsilon)
+
+        holds for every head, key j can never again take more than epsilon of any future attention weight (F_i only
+        falls as i grows), so dropping it changes nothing beyond that tolerance. The first `EVICT_SINKS` keys and the
+        current query block are always kept. Returns the kept-column index, or None if nothing is dropped.
+
+        Invariant: eviction only removes whole positions from this layer's KV cache and its forget sums, which stay
+        aligned; it is skipped while an attention mask is in play, because that mask is indexed by position.
+        """
+        layer = past_key_values.layers[self.layer_idx]
+        length = keys_forget.shape[-1]
+        if length < EVICT_SINKS + EVICT_EVERY or (length - queries) % EVICT_EVERY:
+            return None
+        bound = 2 * self.log_temperature.exp().to(keys_forget.dtype) * self.head_dim**0.5
+        margin = keys_forget[..., -1:] - keys_forget  # F_i - F_j at the newest query, per head (<= 0)
+        keep = (margin.amax(dim=1)[0] + bound > math.log(self.config.kv_evict_epsilon)).clone()
+        keep[:EVICT_SINKS] = True
+        keep[-queries:] = True
+        if bool(keep.all()):
+            return None
+        index = keep.nonzero(as_tuple=True)[0]
+        layer.keys = layer.keys.index_select(2, index)
+        layer.values = layer.values.index_select(2, index)
+        return index
+
     def _attend(self, gate_source, query, key, value, attention_mask, past_key_values):
         # Cumulative log forget gates; the key-side sums stay in fp32 next to the cache, since they grow with the context
         cumulative = F.logsigmoid(self.forget_proj(gate_source).float()).transpose(1, 2).cumsum(-1)  # (batch, heads, seq)
@@ -294,6 +328,11 @@ class HydrogenAttention(nn.Module):
                 keys_forget = torch.cat([previous, cumulative], -1)
             else:
                 keys_forget = cumulative
+            if self.config.kv_evict_epsilon and attention_mask is None and keys_forget.shape[0] == 1:
+                index = self._evict(past_key_values, keys_forget, query.shape[-2])
+                if index is not None:
+                    keys_forget = keys_forget.index_select(-1, index)
+                    key, value = past_key_values.layers[self.layer_idx].keys, past_key_values.layers[self.layer_idx].values
             store[("forget", self.layer_idx)] = keys_forget
         queries, k_len = query.shape[-2], key.shape[-2]
         query_forget = cumulative[..., -queries:]
@@ -357,11 +396,14 @@ class HydrogenMLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
         self.activation_fn = ACT2FN[config.hidden_act]
         self.canon = CanonConv(2 * intermediate_size)
+        self.record = None  # novelty decoding: the last token's hidden activation
 
     def forward(self, hidden_states, past_key_values=None, padding_mask=None):
         up = mask_padding(self.gate_up_proj(hidden_states), padding_mask)
         gate, up = self.canon(up, past_key_values, self.layer_idx, CANON_D).chunk(2, dim=-1)
         hidden = up * self.activation_fn(gate)
+        if self.record is not None:
+            self.record = hidden[:, -1].float()
         out = self.down_proj(hidden)
         delta = None if past_key_values is None else side_states(past_key_values).get(("session", self.layer_idx))
         if delta is not None:  # what this session has learned so far: a per-sequence correction of down_proj
@@ -512,6 +554,8 @@ class HydrogenDecoderLayer(GradientCheckpointingLayer):
         )
         hidden_states = self.hc_mix.write(hidden_states, mixed, post, comb)
         collapsed, post, comb = self.hc_mlp(hidden_states)
+        if self.mlp.record is not None:
+            self.record_post = post[:, -1].float().mean(-1)  # how strongly the MLP output reaches the mean of the streams
         normed = self.canon_c(mask_padding(self.post_attention_layernorm(collapsed[..., 0, :]), padding_mask), past_key_values, self.layer_idx, CANON_C)
         return self.hc_mlp.write(hidden_states, self.mlp(normed, past_key_values, padding_mask), post, comb)
 
@@ -571,6 +615,7 @@ class HydrogenModel(HydrogenPreTrainedModel):
         # parts that look at other tokens' decoder states) end in exactly the state a full prefill would leave
         decoder_layers = config.num_hidden_layers - config.encoder_layers
         self.replay_tokens = decoder_layers * 4 * (CANON_KERNEL - 1) + 1
+        self.record_final = False
         self.post_init()
 
     @merge_with_config_defaults
@@ -637,7 +682,10 @@ class HydrogenModel(HydrogenPreTrainedModel):
                     if padding_mask is not None:
                         common["padding_mask"] = padding_mask[:, -replay:]
 
-        return BaseModelOutputWithPast(last_hidden_state=self.norm(hidden_states.mean(-2)), past_key_values=past_key_values)
+        final = hidden_states.mean(-2)
+        if self.record_final:
+            self.recorded_final = final[:, -1].float()
+        return BaseModelOutputWithPast(last_hidden_state=self.norm(final), past_key_values=past_key_values)
 
     def _decode_while_learning(self, hidden_states, causal_mask, common, kwargs, session):
         """
@@ -678,6 +726,84 @@ class HydrogenModel(HydrogenPreTrainedModel):
         return BaseModelOutputWithPast(last_hidden_state=torch.cat(finals, dim=1), past_key_values=past)
 
 
+def decoder_mlps(model) -> list:
+    return [layer.mlp for layer in model.model.layers[model.config.encoder_layers :]]
+
+
+def session_update(model, store, mlp, delta, step) -> None:
+    """
+    Apply one session step to a layer's correction and store it again.
+
+    `step` is the raw gradient direction. The correction is then bounded to `session_drift_cap` times the RMS of the
+    weight it corrects, so however long a session runs it stays a correction rather than a different model, and it is
+    kept in bf16, which halves the per-session state and measured the same on the bench. (Momentum and per-layer
+    normalized steps were measured too: both were worse, so neither is here.)
+    """
+    delta = delta.detach().float() + step
+    limit = model.session_drift_cap * mlp.down_proj.weight.float().pow(2).mean().sqrt()
+    scale = (limit / (delta.pow(2).mean((-2, -1), keepdim=True).sqrt() + 1e-12)).clamp(max=1.0)
+    store[("session", mlp.layer_idx)] = (delta * scale).to(model.session_dtype).detach()
+
+
+def session_deltas(mlps, store, batch) -> list[torch.Tensor]:
+    """This session's corrections to the decoder MLP output projections, as fresh leaves that gradients can reach."""
+    deltas = []
+    for mlp in mlps:
+        delta = store.get(("session", mlp.layer_idx))
+        if delta is None:
+            delta = mlp.down_proj.weight.new_zeros(batch, *mlp.down_proj.weight.shape)
+        if not (delta.is_leaf and delta.requires_grad):  # reuse the leaf while it is unchanged (one answer = one leaf)
+            delta = delta.detach().requires_grad_(True)
+        store[("session", mlp.layer_idx)] = delta
+        deltas.append(delta)
+    return deltas
+
+
+def flush_novelty(model, store) -> None:
+    """
+    Turn the generated tokens recorded so far into novelty gradients: for every decoder layer, the direct-path
+    gradient of -log p(own token) with respect to its session correction, summed over tokens. The direct path is the
+    route every MLP output takes into the residual streams and on through the final norm to the output head; it needs
+    no backward pass - only what the forward already computed and one product with the output embedding per token.
+    """
+    steps = [step for step in store.pop("novelty_steps", []) if step["token"] is not None]
+    if not steps:
+        return
+    embedding = model.lm_head.weight.float()
+    norm = model.model.norm
+    token = torch.cat([step["token"] for step in steps], dim=1)  # (batch, T)
+    g_h = torch.stack([step["expected"] for step in steps], dim=1) - embedding[token]  # E^T (p - onehot)
+    x = torch.stack([step["final"] for step in steps], dim=1)
+    w = norm.weight.float()
+    r = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon)
+    wg = w * g_h
+    g_x = wg * r - x * (wg * x).mean(-1, keepdim=True) * r.pow(3)  # back through the RMSNorm
+    for i, mlp in enumerate(decoder_mlps(model)):
+        hidden = torch.stack([step["hidden"][i] for step in steps], dim=1)
+        reach = torch.stack([step["post"][i] for step in steps], dim=1)[..., None]
+        grad = torch.einsum("bto,bti->boi", g_x * reach, hidden)
+        key = ("novelty", mlp.layer_idx)
+        store[key] = grad if key not in store else store[key] + grad
+    store["novelty_count"] = store.get("novelty_count", 0) + len(steps)
+
+
+def apply_novelty(model, store) -> None:
+    """
+    Novelty learning, applied between answers: the gradient that makes the tokens the model just generated more
+    likely was summed while it generated them; now the session corrections take a step *against* it, so the next answer
+    is pushed away from the previous one. Nothing changes in the middle of an answer, which stays self-consistent.
+    """
+    flush_novelty(model, store)
+    count = store.pop("novelty_count", 0)
+    for mlp in decoder_mlps(model):
+        grad = store.pop(("novelty", mlp.layer_idx), None)
+        if grad is None or not count:
+            continue
+        delta = store.get(("session", mlp.layer_idx))
+        delta = torch.zeros_like(grad) if delta is None else delta
+        session_update(model, store, mlp, delta, model.config.novelty_rate * grad / count)
+
+
 class SessionLearner:
     """
     Learns while reading: holds this session's corrections to the decoder MLP output projections (stored in the cache
@@ -691,19 +817,13 @@ class SessionLearner:
         self.chunk = model.session_chunk
         past = past_key_values.get_seq_length()
         self.mask = None if attention_mask is None else attention_mask[:, past:]
-        self.mlps = [layer.mlp for layer in model.model.layers[model.config.encoder_layers :]]
+        self.mlps = decoder_mlps(model)
         self.deltas = []
         self.logits = []
+        apply_novelty(model, self.store)
 
     def prepare(self):
-        self.deltas = []
-        for mlp in self.mlps:
-            delta = self.store.get(("session", mlp.layer_idx))
-            if delta is None:
-                delta = mlp.down_proj.weight.new_zeros(self.ids.shape[0], *mlp.down_proj.weight.shape, dtype=torch.float32)
-            delta = delta.detach().requires_grad_(True)
-            self.store[("session", mlp.layer_idx)] = delta
-            self.deltas.append(delta)
+        self.deltas = session_deltas(self.mlps, self.store, self.ids.shape[0])
 
     def learn(self, final_hidden, span):
         logits = self.model.lm_head(final_hidden)
@@ -718,11 +838,16 @@ class SessionLearner:
             loss = ((loss * weight).sum(-1) / weight.sum(-1).clamp_min(1)).sum()
             grads = torch.autograd.grad(loss, self.deltas, allow_unused=True)
         for mlp, delta, grad in zip(self.mlps, self.deltas, grads):
-            self.store[("session", mlp.layer_idx)] = delta.detach() if grad is None else (delta - self.rate * grad).detach()
+            if grad is None:
+                self.store[("session", mlp.layer_idx)] = delta.detach()
+            else:
+                session_update(self.model, self.store, mlp, delta, -self.rate * grad)
 
 
 class HydrogenForCausalLM(HydrogenPreTrainedModel, GenerationMixin):
     session_chunk = SESSION_CHUNK
+    session_drift_cap = 0.1  # a correction stays this small relative to the weight it corrects
+    session_dtype = torch.bfloat16
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -755,6 +880,46 @@ class HydrogenForCausalLM(HydrogenPreTrainedModel, GenerationMixin):
             )
         logits = torch.cat(learner.logits, dim=1)
         return logits[:, -logits_to_keep:] if isinstance(logits_to_keep, int) and logits_to_keep > 0 else logits
+
+    def _decode_with_novelty(self, input_ids, attention_mask, position_ids, past_key_values):
+        """
+        A decoding step that also records what novelty learning needs about it (see `flush_novelty`): the token
+        arriving now is the one sampled from the previous step. Nothing changes until the next input arrives, so an
+        answer stays self-consistent; then `apply_novelty` steps the session away from it.
+        """
+        store = side_states(past_key_values)
+        steps = store.setdefault("novelty_steps", [])
+        if steps and steps[-1]["token"] is None:
+            steps[-1]["token"] = input_ids[:, -1:]
+        if len(steps) >= 256:  # fold long answers in as they go, to bound the recorded state
+            flush_novelty(self, store)
+            steps = store.setdefault("novelty_steps", [])
+        mlps = decoder_mlps(self)
+        layers = self.model.layers[self.config.encoder_layers :]
+        for mlp in mlps:
+            mlp.record = True
+        self.model.record_final = True
+        try:
+            hidden = self.model(
+                input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
+                past_key_values=past_key_values, use_cache=True,
+            ).last_hidden_state
+            logits = self.lm_head(hidden[:, -1:])
+            probs = logits[:, -1].float().softmax(-1)
+            steps.append(
+                dict(
+                    token=None,
+                    expected=probs @ self.lm_head.weight.float(),  # E^T p
+                    final=self.model.recorded_final,
+                    hidden=[mlp.record for mlp in mlps],
+                    post=[layer.record_post for layer in layers],
+                )
+            )
+        finally:
+            for mlp in mlps:
+                mlp.record = None
+            self.model.record_final = False
+        return logits
 
     @can_return_tuple
     def forward(
@@ -795,6 +960,19 @@ class HydrogenForCausalLM(HydrogenPreTrainedModel, GenerationMixin):
         ):
             logits = self._session_learning(input_ids, attention_mask, position_ids, past_key_values, logits_to_keep)
             return CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values)
+        if (
+            self.config.novelty_rate
+            and not self.training
+            and labels is None
+            and input_ids is not None
+            and input_ids.shape[1] == 1
+            and past_key_values is not None
+            and not torch.is_inference_mode_enabled()
+        ):
+            logits = self._decode_with_novelty(input_ids, attention_mask, position_ids, past_key_values)
+            return CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values)
+        if self.config.novelty_rate and past_key_values is not None and not self.training:
+            apply_novelty(self, side_states(past_key_values))  # new input: step away from the last answer
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
