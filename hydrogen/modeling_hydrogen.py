@@ -97,6 +97,32 @@ def mask_padding(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
     return x if mask is None else x * mask[:, :, None].to(x.dtype)
 
 
+# Grouped-query attention is handed to `scaled_dot_product_attention` directly where the backend supports it; the MPS
+# and privateuse (NPU) kernels do not, so there the key and value heads are expanded first, which is equivalent.
+GQA_BACKENDS = ("cuda", "cpu", "xpu")
+
+
+def attend(query, key, value, attn_mask, scale):
+    if query.shape[1] != key.shape[1] and query.device.type not in GQA_BACKENDS:
+        repeats = query.shape[1] // key.shape[1]
+        key, value = key.repeat_interleave(repeats, dim=1), value.repeat_interleave(repeats, dim=1)
+        return F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, scale=scale)
+    return F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, scale=scale, enable_gqa=True)
+
+
+def state_dtype(device: torch.device | str) -> torch.dtype:
+    """
+    bf16 for the per-session state wherever the device really has it (it measured free and halves the memory), fp32
+    otherwise: older CUDA cards, macOS before 14 and CPU builds without bf16 kernels would otherwise fail or crawl.
+    """
+    device = torch.device(device)
+    if device.type == "cuda":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    if device.type == "mps":
+        return torch.bfloat16 if torch.backends.mps.is_macos_or_newer(14, 0) else torch.float32
+    return torch.bfloat16
+
+
 class HydrogenCache(DynamicCache):
     """
     `DynamicCache` plus Hydrogen's side states (the fp32 cumulative forget gates of forgetting attention, per layer, and
@@ -352,11 +378,7 @@ class HydrogenAttention(nn.Module):
                 bias = bias.masked_fill(~attention_mask[..., start:stop, :], float("-inf"))
             else:
                 bias = bias + attention_mask[..., start:stop, :].float()
-            outputs.append(
-                F.scaled_dot_product_attention(
-                    query[..., start:stop, :], key, value, attn_mask=bias.to(query.dtype), scale=self.scaling, enable_gqa=True
-                )
-            )
+            outputs.append(attend(query[..., start:stop, :], key, value, bias.to(query.dtype), self.scaling))
         return torch.cat(outputs, dim=-2).transpose(1, 2)
 
 
@@ -742,7 +764,8 @@ def session_update(model, store, mlp, delta, step) -> None:
     delta = delta.detach().float() + step
     limit = model.session_drift_cap * mlp.down_proj.weight.float().pow(2).mean().sqrt()
     scale = (limit / (delta.pow(2).mean((-2, -1), keepdim=True).sqrt() + 1e-12)).clamp(max=1.0)
-    store[("session", mlp.layer_idx)] = (delta * scale).to(model.session_dtype).detach()
+    dtype = model.session_dtype or state_dtype(delta.device)
+    store[("session", mlp.layer_idx)] = (delta * scale).to(dtype).detach()
 
 
 def session_deltas(mlps, store, batch) -> list[torch.Tensor]:
@@ -847,7 +870,7 @@ class SessionLearner:
 class HydrogenForCausalLM(HydrogenPreTrainedModel, GenerationMixin):
     session_chunk = SESSION_CHUNK
     session_drift_cap = 0.1  # a correction stays this small relative to the weight it corrects
-    session_dtype = torch.bfloat16
+    session_dtype = None  # set per device by `state_dtype`; assign a dtype to force one
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -1243,20 +1266,29 @@ class HydrogenAudioEncoder(nn.Module):
         return nn.functional.interpolate(waveform[:, None], size=target, mode="linear", align_corners=False)[:, 0]
 
     def log_mel(self, waveform: torch.Tensor) -> torch.Tensor:
-        """(batch, samples) -> (batch, n_mels, frames), normalized the way Whisper does for stable scales."""
+        """
+        (batch, samples) -> (batch, n_mels, frames), normalized the way Whisper does for stable scales.
+
+        The short-time Fourier transform has no MPS kernel, so there it runs on the CPU and comes back: it is a few
+        milliseconds per clip and keeps one code path for every device.
+        """
+        device = waveform.device
+        if device.type == "mps":
+            waveform = waveform.cpu()
         spectrogram = torch.stft(
             waveform,
             self.config.n_fft,
             self.config.hop_length,
-            window=self.window.to(waveform.dtype),
+            window=self.window.to(device=waveform.device, dtype=waveform.dtype),
             return_complex=True,
             center=True,
             pad_mode="reflect",
         )
-        mel = self.filters.to(spectrogram.real.dtype) @ spectrogram.abs().pow(2)
+        filters = self.filters.to(device=spectrogram.device, dtype=spectrogram.real.dtype)
+        mel = filters @ spectrogram.abs().pow(2)
         log_mel = torch.log10(mel.clamp_min(1e-10))
         log_mel = torch.maximum(log_mel, log_mel.amax(dim=(-2, -1), keepdim=True) - 8.0)
-        return (log_mel + 4.0) / 4.0
+        return ((log_mel + 4.0) / 4.0).to(device)
 
     def forward(self, waveform: torch.Tensor, sample_rate: int | None = None) -> torch.Tensor:
         """
